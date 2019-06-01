@@ -28,6 +28,18 @@ namespace MLAPI.SceneManagement
         /// </summary>
         public static event SceneSwitchedDelegate OnSceneSwitched;
 
+        public static bool useCustomHandler = false;
+        public static uint customSceneIndex = 0;
+
+        public delegate void CustomHandlerLoadSceneDelegate(Action sceneLoadingFinished);
+        public static event CustomHandlerLoadSceneDelegate onCustomHandlerLoadScene;
+
+        public delegate bool CustomHandlerIsSceneSwitchAllowedDelegate();
+        public static event CustomHandlerIsSceneSwitchAllowedDelegate onCustomHandlerIsSceneSwitchAllowed;
+
+        public delegate bool CustomHandlerHasSceneMismatchDelegate();
+        public static event CustomHandlerHasSceneMismatchDelegate onCustomHandlerHasSceneMismatch;
+
         internal static readonly HashSet<string> registeredSceneNames = new HashSet<string>();
         internal static readonly Dictionary<string, uint> sceneNameToIndex = new Dictionary<string, uint>();
         internal static readonly Dictionary<uint, string> sceneIndexToString = new Dictionary<uint, string>();
@@ -115,81 +127,182 @@ namespace MLAPI.SceneManagement
             return switchSceneProgress;
         }
 
+        /// <summary>
+        /// Switches to a scene using custom scene load and unload handler. Can only be called from Server
+        /// </summary>
+        /// <param name="sceneName">The name of the scene to switch to</param>
+        public static void SwitchSceneCustomHandler()
+        {
+            if (!NetworkingManager.Singleton.IsServer)
+            {
+                throw new NotServerException("Only server can start a scene switch");
+            }
+            else if (isSwitching)
+            {
+                if (LogHelper.CurrentLogLevel <= LogLevel.Normal) LogHelper.LogWarning("Scene switch already in progress");
+                return;
+            }
+            else if (!onCustomHandlerIsSceneSwitchAllowed()) // TODO We always return 'true' here for now.
+            {
+                if (LogHelper.CurrentLogLevel <= LogLevel.Normal) LogHelper.LogWarning("Scene switch is not allowed.");
+                return;
+            }
+
+            SpawnManager.ServerDestroySpawnedSceneObjects(); //Destroy current scene objects before switching.
+            isSwitching = true;
+
+            SceneSwitchProgress switchSceneProgress = new SceneSwitchProgress();
+            sceneSwitchProgresses.Add(switchSceneProgress.guid, switchSceneProgress);
+            currentSceneSwitchProgressGuid = switchSceneProgress.guid;
+
+            // TODO I don't think we need this
+//            isSpawnedObjectsPendingInDontDestroyOnLoad = true;
+
+            onCustomHandlerLoadScene(() => OnSceneLoaded(switchSceneProgress.guid, null));
+        }
+
         // Called on client
         internal static void OnSceneSwitch(uint sceneIndex, Guid switchSceneGuid, Stream objectStream)
         {
-            if (!sceneIndexToString.ContainsKey(sceneIndex) || !registeredSceneNames.Contains(sceneIndexToString[sceneIndex]))
+            if (useCustomHandler)
             {
-                if (LogHelper.CurrentLogLevel <= LogLevel.Normal) LogHelper.LogWarning("Server requested a scene switch to a non registered scene");
-                return;
+                if (!onCustomHandlerIsSceneSwitchAllowed()) // TODO We always return 'true' here for now.
+                {
+                    if (LogHelper.CurrentLogLevel <= LogLevel.Normal) LogHelper.LogWarning("Server requested a scene switch to a non registered scene");
+                    return;
+                }
+                if (customSceneIndex > sceneIndex)
+                {
+                    return; //This scene is already loaded. This usually happends at first load
+                }
+
+                // TODO I don't think we need this
+//                isSpawnedObjectsPendingInDontDestroyOnLoad = true;
+
+                onCustomHandlerLoadScene(() =>
+                {
+                    OnSceneLoaded(switchSceneGuid, objectStream);
+                });
             }
-            else if (SceneManager.GetActiveScene().name == sceneIndexToString[sceneIndex])
+            else
             {
-                return; //This scene is already loaded. This usually happends at first load
+                if (!sceneIndexToString.ContainsKey(sceneIndex) || !registeredSceneNames.Contains(sceneIndexToString[sceneIndex]))
+                {
+                    if (LogHelper.CurrentLogLevel <= LogLevel.Normal) LogHelper.LogWarning("Server requested a scene switch to a non registered scene");
+                    return;
+                }
+                else if (SceneManager.GetActiveScene().name == sceneIndexToString[sceneIndex])
+                {
+                    return; //This scene is already loaded. This usually happends at first load
+                }
+                lastScene = SceneManager.GetActiveScene();
+
+                // Move ALL networked objects to the temp scene
+                MoveObjectsToDontDestroyOnLoad();
+
+                isSpawnedObjectsPendingInDontDestroyOnLoad = true;
+
+                string sceneName = sceneIndexToString[sceneIndex];
+
+                AsyncOperation sceneLoad = SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Single);
+                nextSceneName = sceneName;
+
+                sceneLoad.completed += (AsyncOperation asyncOp2) =>
+                {
+                    OnSceneLoaded(switchSceneGuid, objectStream);
+                };
             }
-
-            lastScene = SceneManager.GetActiveScene();
-
-            // Move ALL networked objects to the temp scene
-            MoveObjectsToDontDestroyOnLoad();
-
-            isSpawnedObjectsPendingInDontDestroyOnLoad = true;
-
-            string sceneName = sceneIndexToString[sceneIndex];
-
-            AsyncOperation sceneLoad = SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Single);
-            nextSceneName = sceneName;
-
-            sceneLoad.completed += (AsyncOperation asyncOp2) =>
-            {
-                OnSceneLoaded(switchSceneGuid, objectStream);
-            };
         }
 
         internal static void OnFirstSceneSwitchSync(uint sceneIndex, Guid switchSceneGuid)
         {
-            if (!sceneIndexToString.ContainsKey(sceneIndex) || !registeredSceneNames.Contains(sceneIndexToString[sceneIndex]))
+            if (useCustomHandler)
             {
-                if (LogHelper.CurrentLogLevel <= LogLevel.Normal) LogHelper.LogWarning("Server requested a scene switch to a non registered scene");
-                return;
-            }
-            else if (SceneManager.GetActiveScene().name == sceneIndexToString[sceneIndex])
-            {
-                return; //This scene is already loaded. This usually happends at first load
-            }
-
-            lastScene = SceneManager.GetActiveScene();
-            string sceneName = sceneIndexToString[sceneIndex];
-            nextSceneName = sceneName;
-            CurrentActiveSceneIndex = sceneNameToIndex[sceneName];
-
-            isSpawnedObjectsPendingInDontDestroyOnLoad = true;
-            SceneManager.LoadScene(sceneName);
-
-            using (PooledBitStream stream = PooledBitStream.Get())
-            {
-                using (PooledBitWriter writer = PooledBitWriter.Get(stream))
+                if (!onCustomHandlerIsSceneSwitchAllowed()) // TODO We always return 'true' here for now.
                 {
-                    writer.WriteByteArray(switchSceneGuid.ToByteArray());
-                    InternalMessageSender.Send(NetworkingManager.Singleton.ServerClientId, MLAPIConstants.MLAPI_CLIENT_SWITCH_SCENE_COMPLETED, "MLAPI_INTERNAL", stream, SecuritySendFlags.None, null);
+                    if (LogHelper.CurrentLogLevel <= LogLevel.Normal) LogHelper.LogWarning("Server requested a scene switch to a non registered scene");
+                    return;
                 }
-            }
+                if (customSceneIndex > sceneIndex)
+                {
+                    return; //This scene is already loaded. This usually happends at first load
+                }
 
-            isSwitching = false;
+                customSceneIndex++;
+
+                // TODO I don't think we need this
+//                isSpawnedObjectsPendingInDontDestroyOnLoad = true;
+
+                onCustomHandlerLoadScene(() =>
+                {
+                    using (PooledBitStream stream = PooledBitStream.Get())
+                    {
+                        using (PooledBitWriter writer = PooledBitWriter.Get(stream))
+                        {
+                            writer.WriteByteArray(switchSceneGuid.ToByteArray());
+                            InternalMessageSender.Send(NetworkingManager.Singleton.ServerClientId, MLAPIConstants.MLAPI_CLIENT_SWITCH_SCENE_COMPLETED, "MLAPI_INTERNAL", stream, SecuritySendFlags.None, null);
+                        }
+                    }
+
+                    isSwitching = false;
+                });
+            }
+            else
+            {
+                if (!sceneIndexToString.ContainsKey(sceneIndex) || !registeredSceneNames.Contains(sceneIndexToString[sceneIndex]))
+                {
+                    if (LogHelper.CurrentLogLevel <= LogLevel.Normal) LogHelper.LogWarning("Server requested a scene switch to a non registered scene");
+                    return;
+                }
+                else if (SceneManager.GetActiveScene().name == sceneIndexToString[sceneIndex])
+                {
+                    return; //This scene is already loaded. This usually happends at first load
+                }
+
+                lastScene = SceneManager.GetActiveScene();
+                string sceneName = sceneIndexToString[sceneIndex];
+                nextSceneName = sceneName;
+                CurrentActiveSceneIndex = sceneNameToIndex[sceneName];
+
+                isSpawnedObjectsPendingInDontDestroyOnLoad = true;
+                SceneManager.LoadScene(sceneName);
+
+                using (PooledBitStream stream = PooledBitStream.Get())
+                {
+                    using (PooledBitWriter writer = PooledBitWriter.Get(stream))
+                    {
+                        writer.WriteByteArray(switchSceneGuid.ToByteArray());
+                        InternalMessageSender.Send(NetworkingManager.Singleton.ServerClientId, MLAPIConstants.MLAPI_CLIENT_SWITCH_SCENE_COMPLETED, "MLAPI_INTERNAL", stream, SecuritySendFlags.None, null);
+                    }
+                }
+
+                isSwitching = false;
+            }
         }
 
         private static void OnSceneLoaded(Guid switchSceneGuid, Stream objectStream)
         {
-            CurrentActiveSceneIndex = sceneNameToIndex[nextSceneName];
-            Scene nextScene = SceneManager.GetSceneByName(nextSceneName);
-            SceneManager.SetActiveScene(nextScene);
+            if (useCustomHandler)
+            {
+                customSceneIndex++;
 
-            // Move all objects to the new scene
-            MoveObjectsToScene(nextScene);
+                // TODO I don't think we need this
+//                isSpawnedObjectsPendingInDontDestroyOnLoad = false;
+            }
+            else
+            {
+                CurrentActiveSceneIndex = sceneNameToIndex[nextSceneName];
+                Scene nextScene = SceneManager.GetSceneByName(nextSceneName);
+                SceneManager.SetActiveScene(nextScene);
 
-            isSpawnedObjectsPendingInDontDestroyOnLoad = false;
+                // Move all objects to the new scene
+                MoveObjectsToScene(nextScene);
 
-            currentSceneIndex = CurrentActiveSceneIndex;
+                isSpawnedObjectsPendingInDontDestroyOnLoad = false;
+
+                currentSceneIndex = CurrentActiveSceneIndex;
+            }
+
 
             if (NetworkingManager.Singleton.IsServer)
             {
@@ -229,7 +342,7 @@ namespace MLAPI.SceneManagement
                     {
                         using (PooledBitWriter writer = PooledBitWriter.Get(stream))
                         {
-                            writer.WriteUInt32Packed(CurrentActiveSceneIndex);
+                            writer.WriteUInt32Packed(useCustomHandler ? customSceneIndex : CurrentActiveSceneIndex);
                             writer.WriteByteArray(switchSceneGuid.ToByteArray());
 
                             uint sceneObjectsToSpawn = 0;
@@ -394,7 +507,17 @@ namespace MLAPI.SceneManagement
 
         internal static bool HasSceneMismatch(uint sceneIndex)
         {
-            return SceneManager.GetActiveScene().name != sceneIndexToString[sceneIndex];
+            if (useCustomHandler)
+            {
+                // TODO Pretend it's all fine for now. I think this check can and should be used to let
+                // TODO the user decide how to determine scene mismatch because he/she is now in charge of
+                // TODO loading and unloading scenes (additively or not doesn't matter).
+                return onCustomHandlerHasSceneMismatch(); // TODO We always return 'false' here for now.
+            }
+            else
+            {
+                return SceneManager.GetActiveScene().name != sceneIndexToString[sceneIndex];
+            }
         }
 
         // Called on server

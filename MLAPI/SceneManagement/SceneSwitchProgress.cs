@@ -88,7 +88,7 @@ namespace MLAPI.SceneManagement
 
         internal void CheckCompletion()
         {
-            if (!IsCompleted && DoneClients.Count == NetworkingManager.Singleton.ConnectedClientsList.Count && sceneLoadOperation.isDone)
+            if (!IsCompleted && DoneClients.Count == NetworkingManager.Singleton.ConnectedClientsList.Count && (NetworkSceneManager.useCustomHandler || sceneLoadOperation.isDone))
             {
                 IsCompleted = true;
                 IsAllClientsDoneLoading = true;
